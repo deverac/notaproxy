@@ -1,0 +1,11 @@
+# This is a config file for thttpd server.
+
+dir=./www
+logfile=/tmp/nota-thttpd.log
+port=8081
+cgipat=/index.cgi
+
+# Must be root for these
+#pidfile=/var/run/px-thttpd.pid
+#user=nobody
+#chroot

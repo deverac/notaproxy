@@ -1,0 +1,220 @@
+diff -ruN thttpd-2.29/config.h thttpd-2.29mod/config.h
+--- thttpd-2.29/config.h	2011-09-11 11:41:37.000000000 -0500
++++ thttpd-2.29mod/config.h	2023-12-04 18:51:32.792607382 -0600
+@@ -75,7 +75,7 @@
+ ** or whatever.  If you don't want any limit, comment this out, but that's
+ ** probably a really bad idea.
+ */
+-#define CGI_TIMELIMIT 30
++#define CGI_TIMELIMIT 180
+ 
+ /* CONFIGURE: Maximum number of simultaneous CGI programs allowed.
+ ** If this many are already running, then attempts to run more will
+diff -ruN thttpd-2.29/libhttpd.c thttpd-2.29mod/libhttpd.c
+--- thttpd-2.29/libhttpd.c	2018-05-23 14:23:06.000000000 -0500
++++ thttpd-2.29mod/libhttpd.c	2023-12-04 18:52:02.552608154 -0600
+@@ -1175,24 +1175,11 @@
+     static char* header;
+     static size_t maxlocation = 0, maxheader = 0;
+     static char headstr[] = "Location: ";
+-
+-    if ( hc->query[0] != '\0')
+-	{
+-	char* cp = strchr( hc->encodedurl, '?' );
+-	if ( cp != (char*) 0 )	/* should always find it */
+-	    *cp = '\0';
+-	httpd_realloc_str(
+-	    &location, &maxlocation,
+-	    strlen( hc->encodedurl ) + 2 + strlen( hc->query ) );
+-	(void) my_snprintf( location, maxlocation,
+-	    "%s/?%s", hc->encodedurl, hc->query );
+-	}
+-    else
+ 	{
+ 	httpd_realloc_str(
+ 	    &location, &maxlocation, strlen( hc->encodedurl ) + 1 );
+ 	(void) my_snprintf( location, maxlocation,
+-	    "%s/", hc->encodedurl );
++	    "/??%s", hc->encodedurl );
+ 	}
+     httpd_realloc_str(
+ 	&header, &maxheader, sizeof(headstr) + strlen( location ) );
+@@ -1681,7 +1668,7 @@
+ 	{
+ 	hc->read_size = 0;
+ 	httpd_realloc_str( &hc->read_buf, &hc->read_size, 500 );
+-	hc->maxdecodedurl =
++	hc->maxdecodedurl = hc->maxhttp_headers =
+ 	    hc->maxorigfilename = hc->maxexpnfilename = hc->maxencodings =
+ 	    hc->maxpathinfo = hc->maxquery = hc->maxaccept =
+ 	    hc->maxaccepte = hc->maxreqhost = hc->maxhostdir =
+@@ -1689,6 +1676,7 @@
+ #ifdef TILDE_MAP_2
+ 	hc->maxaltdir = 0;
+ #endif /* TILDE_MAP_2 */
++	httpd_realloc_str( &hc->http_headers, &hc->maxhttp_headers, 500 );
+ 	httpd_realloc_str( &hc->decodedurl, &hc->maxdecodedurl, 1 );
+ 	httpd_realloc_str( &hc->origfilename, &hc->maxorigfilename, 1 );
+ 	httpd_realloc_str( &hc->expnfilename, &hc->maxexpnfilename, 0 );
+@@ -1734,11 +1722,13 @@
+     (void) memmove( &hc->client_addr, &sa, sockaddr_len( &sa ) );
+     hc->read_idx = 0;
+     hc->checked_idx = 0;
++    hc->file_not_found = 0;
+     hc->checked_state = CHST_FIRSTWORD;
+     hc->method = METHOD_UNKNOWN;
+     hc->status = 0;
+     hc->bytes_to_send = 0;
+     hc->bytes_sent = 0;
++    hc->http_headers[0] = '\0';
+     hc->encodedurl = "";
+     hc->decodedurl[0] = '\0';
+     hc->protocol = "UNKNOWN";
+@@ -2084,6 +2074,15 @@
+ 	    {
+ 	    if ( buf[0] == '\0' )
+ 		break;
++
++	    /* Append HTTP header. */
++	    int plus_one = (hc->http_headers[0] == '\0' ? 0 : 1);
++	    httpd_realloc_str( &hc->http_headers, &hc->maxhttp_headers, strlen( buf ) + plus_one);
++	    if (plus_one) {
++	        (void) strcat( hc->http_headers, "\n" );
++	    }
++	    (void) strcat( hc->http_headers, buf );
++
+ 	    if ( strncasecmp( buf, "Referer:", 8 ) == 0 )
+ 		{
+ 		cp = &buf[8];
+@@ -2489,6 +2488,7 @@
+     if ( hc->initialized )
+ 	{
+ 	free( (void*) hc->read_buf );
++	free( (void*) hc->http_headers );
+ 	free( (void*) hc->decodedurl );
+ 	free( (void*) hc->origfilename );
+ 	free( (void*) hc->expnfilename );
+@@ -3095,6 +3095,8 @@
+ 	envp[envn++] = build_env( "QUERY_STRING=%s", hc->query );
+     envp[envn++] = build_env(
+ 	"REMOTE_ADDR=%s", httpd_ntoa( &hc->client_addr ) );
++    if ( hc->http_headers[0] != '\0')
++	envp[envn++] = build_env( "HTTP_HEADERS=%s", hc->http_headers );
+     if ( hc->referrer[0] != '\0' )
+ 	{
+ 	envp[envn++] = build_env( "HTTP_REFERER=%s", hc->referrer );
+@@ -3380,6 +3382,7 @@
+     char** envp;
+     char* binary;
+     char* directory;
++    char fnf[] = "index.cgi"; /* CGI script to run when file is not found */
+ 
+     /* Unset close-on-exec flag for this socket.  This actually shouldn't
+     ** be necessary, according to POSIX a dup()'d file descriptor does
+@@ -3533,6 +3536,9 @@
+     (void) nice( CGI_NICE );
+ #endif /* CGI_NICE */
+ 
++if (hc->file_not_found) {
++    binary = &fnf[0];
++} else {
+     /* Split the program into directory and binary, so we can chdir()
+     ** to the program's own directory.  This isn't in the CGI 1.1
+     ** spec, but it's what other HTTP servers do.
+@@ -3551,7 +3557,7 @@
+ 	    (void) chdir( directory );  /* ignore errors */
+ 	    }
+ 	}
+-
++}
+     /* Default behavior for SIGPIPE. */
+ #ifdef HAVE_SIGSET
+     (void) sigset( SIGPIPE, SIG_DFL );
+@@ -3665,11 +3671,13 @@
+     /* Is it a directory? */
+     if ( S_ISDIR(hc->sb.st_mode) )
+ 	{
++	hc->file_not_found = 0;
+ 	/* If there's pathinfo, it's just a non-existent file. */
+ 	if ( hc->pathinfo[0] != '\0' )
+ 	    {
+-	    httpd_send_err( hc, 404, err404title, "", err404form, hc->encodedurl );
+-	    return -1;
++	        /* Set flag that file was not found, and run CGI script. */
++	        hc->file_not_found = 1;
++	        return cgi( hc );
+ 	    }
+ 
+ 	/* Special handling for directory URLs that don't end in a slash.
+diff -ruN thttpd-2.29/libhttpd.h thttpd-2.29mod/libhttpd.h
+--- thttpd-2.29/libhttpd.h	2018-05-23 13:46:35.000000000 -0500
++++ thttpd-2.29mod/libhttpd.h	2023-12-04 18:52:38.356609083 -0600
+@@ -97,11 +97,13 @@
+     httpd_sockaddr client_addr;
+     char* read_buf;
+     size_t read_size, read_idx, checked_idx;
++    int file_not_found;
+     int checked_state;
+     int method;
+     int status;
+     off_t bytes_to_send;
+     off_t bytes_sent;
++    char* http_headers;
+     char* encodedurl;
+     char* decodedurl;
+     char* protocol;
+@@ -123,7 +125,7 @@
+     char* authorization;
+     char* remoteuser;
+     char* response;
+-    size_t maxdecodedurl, maxorigfilename, maxexpnfilename, maxencodings,
++    size_t maxdecodedurl, maxorigfilename, maxexpnfilename, maxencodings, maxhttp_headers,
+ 	maxpathinfo, maxquery, maxaccept, maxaccepte, maxreqhost, maxhostdir,
+ 	maxremoteuser, maxresponse;
+ #ifdef TILDE_MAP_2
+diff -ruN thttpd-2.29/README thttpd-2.29mod/README
+--- thttpd-2.29/README	2018-05-23 18:31:02.000000000 -0500
++++ thttpd-2.29mod/README	2023-12-04 18:37:11.772585056 -0600
+@@ -1,3 +1,30 @@
++#################################### NOTICE ####################################
++This is a customized version of thttpd. The following changes have been made:
++
++  * If the requested file is not found, the 'index.cgi' CGI script will be run.
++
++  * When a CGI script is run, all HTTP headers are made available in the
++    HTTP_HEADERS environment variable.
++
++  * The Location specified in an HTTP Redirect will be prefixed with '/??'.
++
++  * The CGI time limit has been increased to three minutes.
++
++  * The thttpd version was changed.
++
++These changes allow thttpd to act as a basic HTTP proxy. For example:
++
++    1. A client requests a file from thttpd.
++    2. thttpd receives a request for the file.
++    3. The file is not found so index.cgi is executed.
++    4. index.cgi fetches the requested resource.
++    5. index.cgi modifies the resource and returns it to the client.
++
++There are many short-comings with proxying in this manner. e.g. Proxying is
++handled by a CGI script so a keep-alive connection is not possible.
++
++################################################################################
++
+              thttpd - tiny/turbo/throttling HTTP server
+                     version 2.29 of 23May2018
+ 
+diff -ruN thttpd-2.29/version.h thttpd-2.29mod/version.h
+--- thttpd-2.29/version.h	2018-05-23 18:30:54.000000000 -0500
++++ thttpd-2.29mod/version.h	2023-12-04 17:17:37.224461249 -0600
+@@ -3,7 +3,7 @@
+ #ifndef _VERSION_H_
+ #define _VERSION_H_
+ 
+-#define SERVER_SOFTWARE "thttpd/2.29 23May2018"
++#define SERVER_SOFTWARE "custom-thttpd/0.01 23Nov2023"
+ #define SERVER_ADDRESS "http://www.acme.com/software/thttpd/"
+ 
+ #endif /* _VERSION_H_ */
